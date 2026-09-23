@@ -30,11 +30,13 @@ set -euo pipefail
 # ============================================================================
 
 readonly VERSION="1.0.1"
+readonly APP_NAME="searxng"
 readonly IMAGE_DEFAULT="docker.io/searxng/searxng:latest"
 readonly PORT_DEFAULT=9123
 readonly BIND_DEFAULT="127.0.0.1"
 readonly USER_MODE_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}"
 readonly USER_MODE_DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
+readonly MARKER_NAME=".searxng-quadlet"
 
 # ============================================================================
 # Global Variables (populated by arg parsing)
@@ -63,10 +65,19 @@ CONFIG_DIR=""
 DATA_DIR=""
 SECRET_ENV=""
 QUADLET_DIR=""
+STATE_ROOT=""
 
 # Podman major version (populated by check_podman; defaults to 0 so any
 # ">= 5" guard safely falls through to the literal-ref path if unset)
 PODMAN_MAJOR=0
+
+# Set by dry_run_render: config/secret generators skip chown (the rendered
+# files live in a scratch dir, and in --mode system the service user may not
+# exist yet / we may not be root).
+RENDER_ONLY=false
+
+# Detected OS id (populated once by detect_os_id; used for package hints)
+OS_ID=""
 
 # ============================================================================
 # Logging Helpers
@@ -94,42 +105,80 @@ info() {
 # ============================================================================
 
 usage() {
-    sed -n '3,/^set -euo pipefail/p' "$0" | sed '$d'
+    cat <<'EOF'
+searxng-quadlet install.sh — Deploy a local SearXNG instance as a Podman quadlet service.
+
+Usage:
+  ./install.sh [OPTIONS]
+
+Options:
+  --mode system|user       Installation mode (default: system)
+  --user NAME              Service username (for --mode system)
+  --port N                 HTTP port (default: 9123)
+  --bind ADDR              Bind address (default: 127.0.0.1)
+  --image REF              Container image reference (default: docker.io/searxng/searxng:latest)
+  --base-url URL           Base URL for SEARXNG_BASE_URL (default: http://${BIND}:${PORT}/)
+  --state-dir PATH         State directory (default: varies by mode)
+  --instance-name TEXT     Instance name for settings.yml
+  --no-json                Disable JSON search format
+  --favicons               Enable favicon caching (writes favicons.toml)
+  --auto-update            Enable podman-auto-update.timer
+  --no-pull                Skip pre-pulling the image
+  --force-settings         Regenerate settings.yml (backs up existing)
+  --dry-run                Print the planned layout and rendered units/settings
+  -y, --yes                Answer yes to interactive prompts (unattended)
+  -h, --help               Show this help message
+EOF
     exit 0
+}
+
+need_arg() {
+    # $1 = option name, $2 = remaining arg count after the option
+    if (( $2 < 2 )); then
+        die "Option $1 requires an argument."
+    fi
 }
 
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case $1 in
             --mode)
+                need_arg "$1" "$#"
                 MODE="$2"
                 shift 2
                 ;;
             --user)
+                need_arg "$1" "$#"
                 USER_NAME="$2"
                 shift 2
                 ;;
             --port)
+                need_arg "$1" "$#"
                 PORT="$2"
                 shift 2
                 ;;
             --bind)
+                need_arg "$1" "$#"
                 BIND="$2"
                 shift 2
                 ;;
             --image)
+                need_arg "$1" "$#"
                 IMAGE="$2"
                 shift 2
                 ;;
             --base-url)
+                need_arg "$1" "$#"
                 BASE_URL="$2"
                 shift 2
                 ;;
             --state-dir)
+                need_arg "$1" "$#"
                 STATE_DIR="$2"
                 shift 2
                 ;;
             --instance-name)
+                need_arg "$1" "$#"
                 INSTANCE_NAME="$2"
                 shift 2
                 ;;
@@ -175,34 +224,48 @@ parse_args() {
         die "Invalid mode: $MODE (must be 'system' or 'user')"
     fi
 
+    # Validate port
+    if [[ ! "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
+        die "Invalid port: $PORT (must be an integer 1-65535)"
+    fi
+
+    # Validate bind address (IPv4, or bracketed/bare IPv6 — accepted loosely,
+    # PublishPort= will reject anything actually malformed)
+    if [[ -z "$BIND" ]]; then
+        die "Invalid bind address: (empty)"
+    fi
+
+    if [[ "$MODE" == "user" && -n "$USER_NAME" ]]; then
+        warn "--user is ignored in --mode user (the invoking user is always used)."
+    fi
+
     # Set derived variables
     if [[ "$MODE" == "system" ]]; then
         SERVICE_USER="${USER_NAME:-searxng}"
-        CONFIG_DIR="/var/lib/${SERVICE_USER}/config"
-        DATA_DIR="/var/lib/${SERVICE_USER}/data"
-        SECRET_ENV="/var/lib/${SERVICE_USER}/secret.env"
-        QUADLET_DIR="/var/lib/${SERVICE_USER}/.config/containers/systemd"
+        STATE_ROOT="/var/lib/${SERVICE_USER}"
+        CONFIG_DIR="${STATE_ROOT}/config"
+        DATA_DIR="${STATE_ROOT}/data"
+        SECRET_ENV="${STATE_ROOT}/secret.env"
+        QUADLET_DIR="${STATE_ROOT}/.config/containers/systemd"
     else
-        SERVICE_USER="$USER"
-        CONFIG_DIR="${USER_MODE_DATA}/${SERVICE_USER}/config"
-        DATA_DIR="${USER_MODE_DATA}/${SERVICE_USER}/data"
-        SECRET_ENV="${USER_MODE_DATA}/${SERVICE_USER}/secret.env"
+        SERVICE_USER="$(id -un)"
+        STATE_ROOT="${USER_MODE_DATA}/${APP_NAME}"
+        CONFIG_DIR="${STATE_ROOT}/config"
+        DATA_DIR="${STATE_ROOT}/data"
+        SECRET_ENV="${STATE_ROOT}/secret.env"
         QUADLET_DIR="${USER_MODE_CONFIG}/containers/systemd"
     fi
 
-    # Apply --state-dir override if provided
+    # Apply --state-dir override if provided (same layout for both modes).
+    # Note: the quadlet dir always moves under STATE_DIR too — in --mode user
+    # this differs from the XDG-default layout, where quadlet units live
+    # under $XDG_CONFIG_HOME regardless of where app state is rooted.
     if [[ -n "$STATE_DIR" ]]; then
-        if [[ "$MODE" == "system" ]]; then
-            CONFIG_DIR="${STATE_DIR}/config"
-            DATA_DIR="${STATE_DIR}/data"
-            SECRET_ENV="${STATE_DIR}/secret.env"
-            QUADLET_DIR="${STATE_DIR}/.config/containers/systemd"
-        else
-            CONFIG_DIR="${STATE_DIR}/config"
-            DATA_DIR="${STATE_DIR}/data"
-            SECRET_ENV="${STATE_DIR}/secret.env"
-            QUADLET_DIR="${STATE_DIR}/.config/containers/systemd"
-        fi
+        STATE_ROOT="$STATE_DIR"
+        CONFIG_DIR="${STATE_DIR}/config"
+        DATA_DIR="${STATE_DIR}/data"
+        SECRET_ENV="${STATE_DIR}/secret.env"
+        QUADLET_DIR="${STATE_DIR}/.config/containers/systemd"
     fi
 
     # Default base URL
@@ -227,18 +290,36 @@ check_systemd() {
     fi
 }
 
+# Populates the global OS_ID from /etc/os-release (ID=, falling back to the
+# first token of ID_LIKE=). Safe to call unconditionally; idempotent.
+detect_os_id() {
+    OS_ID=""
+    if [[ -f /etc/os-release ]]; then
+        OS_ID=$(sed -n 's/^ID=//p' /etc/os-release | tr -d '"')
+        if [[ -z "$OS_ID" ]]; then
+            OS_ID=$(sed -n 's/^ID_LIKE=//p' /etc/os-release | tr -d '"' | awk '{print $1}')
+        fi
+    fi
+}
+
+# Resolves and returns the podman major version on stdout, using the
+# structured `podman version` output where available (more portable than
+# scraping `podman --version`, which needs PCRE-capable grep for -oP).
+podman_major() {
+    local v=""
+    v=$(podman version --format '{{.Client.Version}}' 2>/dev/null || true)
+    if [[ -z "$v" ]]; then
+        v=$(podman --version 2>/dev/null | sed -n 's/.*version \([0-9][0-9.]*\).*/\1/p' | head -1)
+    fi
+    echo "${v%%.*}"
+}
+
 check_podman() {
     info "Checking podman..."
-    if ! command -v podman &>/dev/null; then
-        local os_id=""
-        if [[ -f /etc/os-release ]]; then
-            os_id=$(sed -n 's/^ID=//p' /etc/os-release | tr -d '"')
-            if [[ -z "$os_id" ]]; then
-                os_id=$(sed -n 's/^ID_LIKE=//p' /etc/os-release | awk '{print $1}')
-            fi
-        fi
+    detect_os_id
 
-        case "${os_id:-}" in
+    if ! command -v podman &>/dev/null; then
+        case "${OS_ID:-}" in
             fedora|rhel|centos|rocky|alma)
                 die "podman not found. Install with: sudo dnf install -y podman"
                 ;;
@@ -257,9 +338,8 @@ check_podman() {
         esac
     fi
 
-    local podman_version
-    podman_version=$(podman --version | grep -oP '\d+\.\d+\.\d+' | head -1)
-    local major minor
+    local podman_version major minor
+    podman_version=$(podman --version | sed -n 's/.*version \([0-9][0-9.]*\).*/\1/p' | head -1)
     major=$(echo "$podman_version" | cut -d. -f1)
     minor=$(echo "$podman_version" | cut -d. -f2)
     # Publish for the generators (which run later in the same script)
@@ -274,12 +354,19 @@ check_podman() {
         warn "Podman < 5.0 detected. Image pre-pull (--no-pull) will use literal ref instead of .image unit."
     fi
 
-    # Check for quadlet generator
-    local quadlet_found=false
-    if [[ -f /usr/lib/systemd/user-generators/podman-user-generator ]] || \
-       [[ -f /usr/libexec/podman/quadlet ]]; then
-        quadlet_found=true
-    fi
+    # Check for the quadlet generator across the layouts distros use.
+    local quadlet_found=false gen
+    for gen in \
+        /usr/lib/systemd/user-generators/podman-user-generator \
+        /usr/lib64/systemd/user-generators/podman-user-generator \
+        /usr/local/lib/systemd/user-generators/podman-user-generator \
+        /usr/libexec/podman/quadlet
+    do
+        if [[ -f "$gen" ]]; then
+            quadlet_found=true
+            break
+        fi
+    done
 
     if [[ "$quadlet_found" != true ]]; then
         die "Podman quadlet generator not found (looked in /usr/lib*/systemd/user-generators/podman-user-generator and /usr/libexec/podman/quadlet). Ensure your podman package ships quadlet."
@@ -288,17 +375,29 @@ check_podman() {
     # Check for newuidmap/newgidmap
     if ! command -v newuidmap &>/dev/null || ! command -v newgidmap &>/dev/null; then
         local pkg_hint=""
-        case "${os_id:-}" in
+        case "${OS_ID:-}" in
             fedora|rhel|centos|rocky|alma) pkg_hint="shadow-utils" ;;
-            debian|ubuntu) pkg_hint="shadow" ;;
+            debian|ubuntu) pkg_hint="uidmap" ;;
             arch|manjaro|endeavouros) pkg_hint="shadow" ;;
             suse|opensuse*) pkg_hint="shadow" ;;
         esac
         if [[ "$MODE" == "system" ]]; then
-            die "newuidmap/newgidmap not found — required to allocate subuid ranges for the service user. Install package: ${pkg_hint:-shadow}."
+            die "newuidmap/newgidmap not found — required to allocate subuid ranges for the service user. Install package: ${pkg_hint:-shadow-utils}."
         else
-            warn "newuidmap/newgidmap not found. Install package: ${pkg_hint:-shadow} (rootless containers need subuid allocation)."
+            warn "newuidmap/newgidmap not found. Install package: ${pkg_hint:-shadow-utils} (rootless containers need subuid allocation)."
         fi
+    fi
+
+    if ! command -v curl &>/dev/null; then
+        local curl_hint=""
+        case "${OS_ID:-}" in
+            fedora|rhel|centos|rocky|alma) curl_hint="sudo dnf install -y curl" ;;
+            debian|ubuntu) curl_hint="sudo apt-get install -y curl" ;;
+            arch|manjaro|endeavouros) curl_hint="sudo pacman -S curl" ;;
+            suse|opensuse*) curl_hint="sudo zypper install -y curl" ;;
+            *) curl_hint="install curl (https://curl.se)" ;;
+        esac
+        die "curl not found — required for the post-install health check. Install with: ${curl_hint}"
     fi
 
     podman --version
@@ -306,6 +405,28 @@ check_podman() {
 
 check_port() {
     info "Checking port ${BIND}:${PORT}..."
+
+    # A re-run of the installer will see its own already-running instance
+    # listening on the target port — that's not a conflict, so don't prompt.
+    # (setup_service_account hasn't run yet, so in --mode system this only
+    # detects an *existing* service user; a first-ever run has nothing to
+    # find here anyway, which is fine — there's no prior instance to skip.)
+    local existing_names=""
+    if [[ "$MODE" == "system" ]]; then
+        if id "$SERVICE_USER" &>/dev/null; then
+            local svc_uid
+            svc_uid=$(id -u "$SERVICE_USER")
+            existing_names=$(runuser -u "$SERVICE_USER" -- env XDG_RUNTIME_DIR="/run/user/${svc_uid}" podman ps --format '{{.Names}}' 2>/dev/null || true)
+        fi
+    else
+        existing_names=$(podman ps --format '{{.Names}}' 2>/dev/null || true)
+    fi
+
+    if grep -qx searxng <<< "$existing_names"; then
+        info "Port check skipped: an existing 'searxng' container is already running (this looks like a re-run)."
+        return 0
+    fi
+
     if ss -ltn 2>/dev/null | grep -Eq "[:.]${PORT}([[:space:]]|$)"; then
         warn "Port ${PORT} appears to be in use:"
         ss -tlnp 2>/dev/null | grep -E "[:.]${PORT}([[:space:]]|$)" || true
@@ -358,7 +479,7 @@ setup_service_account() {
         fi
 
         info "Creating system user '${SERVICE_USER}'..."
-        useradd --system --create-home --home-dir "/var/lib/${SERVICE_USER}" --shell "$nologin_shell" "$SERVICE_USER"
+        useradd --system --create-home --home-dir "$STATE_ROOT" --shell "$nologin_shell" "$SERVICE_USER"
         SERVICE_UID=$(id -u "$SERVICE_USER")
     fi
 
@@ -442,6 +563,23 @@ setup_state_dirs() {
 
     install -d -m 0755 "$QUADLET_DIR"
 
+    if [[ "$MODE" == "system" ]]; then
+        # `install -d` only sets owner/mode on the leaf directory it creates,
+        # not on intermediate parents (e.g. .config, .config/containers) —
+        # chown the whole state tree so the service user owns everything
+        # under it, matching the design (one useradd, one chown).
+        chown -R "${SERVICE_USER}:${SERVICE_USER}" "$STATE_ROOT"
+    fi
+
+    # Drop a marker so uninstall.sh --purge can confirm a directory it is
+    # about to rm -rf is actually one we created, not e.g. a caller-supplied
+    # --state-dir/--user that happens to collide with something else.
+    printf '%s\n' "searxng-quadlet state root — safe to remove with uninstall.sh --purge" \
+        > "${STATE_ROOT}/${MARKER_NAME}"
+    if [[ "$MODE" == "system" ]]; then
+        chown "${SERVICE_USER}:${SERVICE_USER}" "${STATE_ROOT}/${MARKER_NAME}"
+    fi
+
     log "Config dir: ${CONFIG_DIR}"
     log "Data dir:   ${DATA_DIR}"
     log "Quadlet:    ${QUADLET_DIR}"
@@ -518,7 +656,7 @@ engines:
 EOF
 
     chmod 0644 "$settings_file"
-    if [[ "$MODE" == "system" ]]; then
+    if [[ "$MODE" == "system" && "$RENDER_ONLY" != true ]]; then
         chown "${SERVICE_USER}:${SERVICE_USER}" "$settings_file"
     fi
 
@@ -539,18 +677,21 @@ generate_favicons_toml() {
 
     info "Generating favicons.toml..."
 
+    # db_url is resolved by SearXNG *inside* the container, whose view of
+    # DATA_DIR is always /var/cache/searxng (the Volume= target below) — not
+    # the host-side DATA_DIR path, which the container never sees.
     cat > "$favicons_file" <<EOF
 [favicons]
 cfg_schema = 1
 
 [favicons.cache]
-db_url = "${DATA_DIR}/faviconcache.db"
+db_url = "/var/cache/searxng/faviconcache.db"
 HOLD_TIME = 5184000
 LIMIT_TOTAL_BYTES = 209715200
 EOF
 
     chmod 0644 "$favicons_file"
-    if [[ "$MODE" == "system" ]]; then
+    if [[ "$MODE" == "system" && "$RENDER_ONLY" != true ]]; then
         chown "${SERVICE_USER}:${SERVICE_USER}" "$favicons_file"
     fi
 
@@ -568,10 +709,14 @@ generate_secret_env() {
     local secret=""
     if command -v openssl &>/dev/null; then
         secret=$(openssl rand -hex 32)
-    elif [[ -f /dev/urandom ]]; then
+    elif [[ -r /dev/urandom ]]; then
+        # /dev/urandom is a character device, not a regular file — test with
+        # -r, not -f (which is always false for it).
         secret=$(od -An -tx1 -N 32 /dev/urandom | tr -d ' \n')
+    elif command -v python3 &>/dev/null; then
+        secret=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
     else
-        die "Cannot generate random bytes. Neither openssl nor /dev/urandom available."
+        die "Cannot generate random bytes. None of openssl, /dev/urandom, or python3 available."
     fi
 
     cat > "$SECRET_ENV" <<EOF
@@ -579,7 +724,7 @@ SEARXNG_SECRET=${secret}
 EOF
 
     chmod 0600 "$SECRET_ENV"
-    if [[ "$MODE" == "system" ]]; then
+    if [[ "$MODE" == "system" && "$RENDER_ONLY" != true ]]; then
         chown "${SERVICE_USER}:${SERVICE_USER}" "$SECRET_ENV"
     fi
 
@@ -646,10 +791,8 @@ generate_image_unit() {
         return 0
     fi
 
-    local podman_version
-    podman_version=$(podman --version | grep -oP '\d+\.\d+' | head -1)
     local major
-    major=$(echo "$podman_version" | cut -d. -f1)
+    major=$(podman_major)
 
     if (( major < 5 )); then
         info "Podman < 5.0 detected. Skipping .image unit (literal ref used in .container)."
@@ -691,8 +834,16 @@ activate_services() {
     info "Reloading systemd user services..."
     as_service_user systemctl --user daemon-reload
 
-    info "Starting searxng.service..."
-    as_service_user systemctl --user start searxng.service
+    # On a re-run the unit files and/or settings.yml may have just been
+    # rewritten while the service was already active — `start` is then a
+    # no-op and the new config never takes effect. Restart in that case.
+    if as_service_user systemctl --user is-active --quiet searxng.service; then
+        info "Restarting searxng.service (already running)..."
+        as_service_user systemctl --user restart searxng.service
+    else
+        info "Starting searxng.service..."
+        as_service_user systemctl --user start searxng.service
+    fi
 
     if [[ "$AUTO_UPDATE" == true ]]; then
         info "Enabling podman-auto-update.timer..."
@@ -787,7 +938,7 @@ print_summary() {
     echo "  Mode:         ${MODE}"
     echo "  Image:        ${IMAGE}"
     echo ""
-    echo "  State Directory:  ${STATE_DIR:-/var/lib/${SERVICE_USER}}"
+    echo "  State Directory:  ${STATE_ROOT}"
     echo "  Config:           ${CONFIG_DIR}"
     echo "  Data:             ${DATA_DIR}"
     echo ""
@@ -812,18 +963,15 @@ print_summary() {
 
 dry_run_render() {
     # Resolve podman major version for the .image/literal-ref decision.
-    local pv=""
     if command -v podman &>/dev/null; then
-        pv=$(podman --version | sed -n 's/.*version \([0-9][0-9.]*\).*/\1/p' | head -1)
-        PODMAN_MAJOR=${pv%%.*}
+        PODMAN_MAJOR=$(podman_major)
     fi
 
-    # In system-mode dry-run the service user may not exist yet; render with the
-    # current user so any chown in the generators targets an existing uid.
-    local saved_user="$SERVICE_USER"
-    if [[ "$MODE" == "system" ]] && ! id "$SERVICE_USER" &>/dev/null; then
-        SERVICE_USER="$USER"
-    fi
+    # Rendered files live in a scratch dir and nothing here is chowned —
+    # RENDER_ONLY makes that explicit so this never touches a real uid,
+    # whether or not the service user exists yet (--mode system dry-run
+    # needs no root and must not require the account to pre-exist).
+    RENDER_ONLY=true
 
     local tmpdir saved_config saved_quadlet f
     tmpdir=$(mktemp -d)
@@ -839,7 +987,7 @@ dry_run_render() {
 
     CONFIG_DIR="$saved_config"
     QUADLET_DIR="$saved_quadlet"
-    SERVICE_USER="$saved_user"
+    RENDER_ONLY=false
 
     for f in "${tmpdir}/config/settings.yml" "${tmpdir}/config/favicons.toml" \
              "${tmpdir}/quadlet/searxng.container" "${tmpdir}/quadlet/searxng.image"; do
@@ -900,7 +1048,7 @@ main() {
 
     activate_services
 
-    perform_health_check
+    perform_health_check || die "SearXNG did not come up — see the journal output above."
 
     print_summary
 

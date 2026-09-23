@@ -2,6 +2,10 @@
 
 A self-contained installer for deploying a local SearXNG instance as a Podman quadlet service on systemd-based Linux systems.
 
+This is an off-network fallback: prefer the cluster instance at
+`mcp-searxng.house.nickistre.net` when it's reachable, and fall back to a local deployment
+from this repo when it isn't (e.g. off the home network).
+
 ## Features
 
 - **Dual installation modes**: System-wide (`--mode system`) or per-user (`--mode user`)
@@ -30,16 +34,7 @@ journalctl --user -u searxng.service -f
 
 ## Installation Modes
 
-### `--mode user` (Default)
-
-Installs into the invoking user's home directory. No root privileges required.
-
-- **Config dir**: `${XDG_DATA_HOME:-~/.local/share}/<user>/config`
-- **Data dir**: `${XDG_DATA_HOME:-~/.local/share}/<user>/data`
-- **Secret env**: `${XDG_DATA_HOME:-~/.local/share}/<user>/secret.env`
-- **Quadlet dir**: `${XDG_CONFIG_HOME:-~/.config}/containers/systemd`
-
-### `--mode system`
+### `--mode system` (Default)
 
 Creates a dedicated system user (`searxng` by default). Requires root.
 
@@ -50,6 +45,15 @@ Creates a dedicated system user (`searxng` by default). Requires root.
 - **Quadlet**: `/var/lib/searxng/.config/containers/systemd`
 
 Automatically allocates subuid/subgid ranges and enables lingering for automatic startup.
+
+### `--mode user`
+
+Installs into the invoking user's own XDG directories. No root privileges required.
+
+- **Config dir**: `${XDG_DATA_HOME:-~/.local/share}/searxng/config`
+- **Data dir**: `${XDG_DATA_HOME:-~/.local/share}/searxng/data`
+- **Secret env**: `${XDG_DATA_HOME:-~/.local/share}/searxng/secret.env`
+- **Quadlet dir**: `${XDG_CONFIG_HOME:-~/.config}/containers/systemd`
 
 ## Command-Line Options
 
@@ -71,6 +75,15 @@ Automatically allocates subuid/subgid ranges and enables lingering for automatic
 | `--dry-run` | Print the planned layout and render units/settings | Execute |
 | `-y`, `--yes` | Answer yes to interactive prompts (unattended / non-TTY) | Prompt |
 | `-h`, `--help` | Show help message | |
+
+**Behavior notes:**
+- Re-running the installer always rewrites the quadlet unit files and restarts the service
+  if it's already running; only `settings.yml`, `favicons.toml`, and `secret.env` are
+  preserved across re-runs (unless `--force-settings` is given).
+- With Podman < 5.0, there is no `.image` unit — the container unit references the image
+  literally instead, and `--no-pull` has no separate effect.
+- `--no-pull` only skips the *pre*-pull `.image` unit; Podman still pulls the image on
+  first container start if it isn't already present locally.
 
 ## Configuration
 
@@ -121,38 +134,38 @@ podman exec searxng cat /etc/searxng/settings.yml
 # Remove service (preserves state)
 ./uninstall.sh --mode user
 
-# Full purge (removes state and service account)
-sudo ./uninstall.sh --mode system --purge
+# Full purge (removes state and service account), unattended
+sudo ./uninstall.sh --mode system --purge -y
 ```
 
+| Option | Description |
+|--------|-------------|
+| `--mode system\|user` | Installation mode (default: `system`) |
+| `--user NAME` | Service username (system mode only) |
+| `--state-dir PATH` | Must match whatever `--state-dir` install.sh was given, if any |
+| `--purge` | Remove state directories and (system mode) the service account |
+| `--purge-image` | With `--purge`, also `podman rmi` the pulled image |
+| `--image REF` | Image ref for `--purge-image` (must match install.sh's `--image`) |
+| `--disable-auto-update` | Also disable `podman-auto-update.timer` |
+| `-y`, `--yes` | Answer yes to interactive prompts (unattended) |
+| `--dry-run` | Print actions without executing |
+
 With `--purge`:
-- Removes state directories (`config/`, `data/`)
-- Disables lingering for the service user
-- Deletes the service user account
-- Prints exactly what will be deleted before proceeding
+- Removes the whole state directory (`config/`, `data/`, `secret.env`)
+- Disables lingering for the service user (system mode)
+- Deletes the service user account (system mode)
+- Prints exactly what will be deleted before proceeding, and refuses to remove a directory
+  that doesn't carry the marker file `install.sh` leaves in the state root — protects
+  against a mistyped `--user`/`--state-dir` pointing at an unrelated path
 
 Without `--purge`:
 - Stops and removes the service
 - Removes quadlet files
 - Preserves all state for future reinstall
 
-## Differences from Wiki Documentation
-
-This installer corrects seven documented defects from the wiki page:
-
-| # | Wiki says | Reality | Fix |
-|---|-----------|---------|-----|
-| 1 | "JSON output … No config change required" | `search.formats` defaults to `[html]` only | **`json` enabled by default** |
-| 2 | `- name: brave_search` | Engine is named `brave` | Corrected in generated `settings.yml` |
-| 3 | `favicon: driver: "filesystem"` | Favicon cache is TOML, enabled via `search.favicon_resolver` | Proper TOML config with `--favicons` flag |
-| 4 | `[Service] Memory=1g` / `PidsLimit=100` | These are `[Container]` keys | Moved to correct section |
-| 5 | `settings.yml` written to quadlet dir | Container mounts named volume | **Bind mounts used instead** |
-| 6 | `useradd --no-create-home` + nologin shell | Rootless needs home dir + subuids | `--create-home` + auto subid allocation |
-| 7 | `systemctl enable searxng.service` | Quadlet units cannot be enabled | `[Install] WantedBy=` handles this |
-
-Additional corrections:
-- Removed inert `server.bind_address: "127.0.0.1"` (Granian uses `GRANIAN_HOST`)
-- `wget` is available in the current image (confirmed) and `/healthz` returns 200, so the in-container health check works
+`podman-auto-update.timer` is shared across every quadlet the service user runs, so it's
+left alone unless you pass `--disable-auto-update`; without the flag, uninstall just warns
+if it's still enabled.
 
 ## MCP / Agent Integration
 
@@ -177,6 +190,27 @@ Response shape:
   ]
 }
 ```
+
+## Differences from Wiki Documentation
+
+The [wiki write-up](https://llm-wiki.house.nickistre.net/wiki/concepts/searxng-hina-local-deployment/)
+this installer is based on has seven defects that would otherwise leave `format=json`
+returning 403, the install failing partway through, or settings being silently ignored.
+This installer corrects all of them:
+
+| # | Wiki says | Reality | Fix |
+|---|-----------|---------|-----|
+| 1 | "JSON output … No config change required" | `search.formats` defaults to `[html]` only | `json` enabled by default in the generated `settings.yml` |
+| 2 | `- name: brave_search` | The engine is named `brave` | Corrected in the generated `settings.yml` |
+| 3 | `favicon: driver: "filesystem"` | No such setting; the favicon cache is a TOML file enabled via `search.favicon_resolver` | Proper `favicons.toml` written with `--favicons` |
+| 4 | `[Service] Memory=1g` / `PidsLimit=100` | These are `[Container]` keys, not `[Service]` keys | Moved to the correct section |
+| 5 | `settings.yml` written to the quadlet dir while the container mounts a named volume | The file never reaches the container | Bind mounts used instead, so `config/settings.yml` is what the container actually sees |
+| 6 | `useradd --no-create-home` + a nologin shell | Rootless quadlets need a home dir, `loginctl enable-linger`, and allocated `/etc/subuid`/`/etc/subgid` ranges | `--create-home` + automatic subuid/subgid allocation + `enable-linger` |
+| 7 | `systemctl --user enable searxng.service` | Quadlet-generated units can't be `enable`d | Skipped — `[Install] WantedBy=default.target` already wires it up; the installer only ever `start`s (or `restart`s on re-run) |
+
+Also fixed: the wiki's `server.bind_address: "127.0.0.1"` setting is inert (the image runs
+Granian, which binds via `GRANIAN_HOST`) — localhost-only exposure comes from
+`PublishPort=127.0.0.1:...` instead, and this installer omits the dead setting.
 
 ## Troubleshooting
 
@@ -219,14 +253,32 @@ wget -qO- http://127.0.0.1:8080/healthz
 ```
 
 ### SELinux permission errors
-The installer uses `:Z` mount option for private labeling. If you still see denials:
-```ini
-# Add to searxng.container [Container] section:
-PodmanArgs=--security-opt label=type:container_runtime_t
+The installer uses the `:Z` mount option, which asks Podman to relabel `config/` and
+`data/` with a private container context on every start. If you still see AVC denials:
+
+```bash
+# See exactly what was denied
+sudo ausearch -m avc -ts recent
+
+# Confirm the mounts actually got relabeled
+ls -Zd /var/lib/searxng/config /var/lib/searxng/data   # or your --state-dir/--mode user paths
 ```
 
-Then rebuild:
+If the context still looks wrong, a manual relabel usually fixes it:
 ```bash
+sudo chcon -Rt container_file_t /var/lib/searxng/config /var/lib/searxng/data
+```
+
+As a last resort you can disable SELinux separation for just this container by adding to
+the `[Container]` section of `searxng.container` — this loosens confinement, so prefer the
+`ausearch`/`chcon` fixes above first:
+```ini
+PodmanArgs=--security-opt label=disable
+```
+
+Then reload and restart:
+```bash
+systemctl --user daemon-reload
 systemctl --user restart searxng.service
 ```
 

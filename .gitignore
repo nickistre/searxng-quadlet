@@ -1,0 +1,5 @@
+# Generated at install time — never commit real deployment secrets/state.
+secret.env
+*.bak-*
+config/
+data/
