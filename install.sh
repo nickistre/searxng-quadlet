@@ -857,7 +857,14 @@ activate_services() {
 
 dump_journal() {
     warn "Last 50 journal lines for searxng.service:"
-    as_service_user journalctl --user -u searxng.service -n 50 --no-pager || true
+    if [[ "$MODE" == "system" ]]; then
+        # A system UID has no per-user journal file — its user units log to the
+        # system journal, which only root can read. Match the unit fields directly.
+        journalctl _UID="$SERVICE_UID" _SYSTEMD_USER_UNIT=searxng.service \
+            + _UID="$SERVICE_UID" USER_UNIT=searxng.service -n 50 --no-pager || true
+    else
+        journalctl --user -u searxng.service -n 50 --no-pager || true
+    fi
     warn "Likely causes:"
     warn "  - Port ${BIND}:${PORT} conflict (ss -ltnp)"
     warn "  - SELinux denials (sudo ausearch -m avc -ts recent)"
@@ -943,10 +950,18 @@ print_summary() {
     echo "  Data:             ${DATA_DIR}"
     echo ""
     echo "  Management Commands:"
-    echo "    Status:   systemctl --user status searxng.service"
-    echo "    Logs:     journalctl --user -u searxng.service -f"
-    echo "    Restart:  systemctl --user restart searxng.service"
-    echo "    Stop:     systemctl --user stop searxng.service"
+    if [[ "$MODE" == "system" ]]; then
+        echo "    Status:   sudo -u ${SERVICE_USER} systemctl --user status searxng.service"
+        echo "    Logs:     sudo journalctl _SYSTEMD_USER_UNIT=searxng.service + USER_UNIT=searxng.service -f"
+        echo "    Restart:  sudo -u ${SERVICE_USER} systemctl --user restart searxng.service"
+        echo "    Stop:     sudo -u ${SERVICE_USER} systemctl --user stop searxng.service"
+        echo "    (journalctl --user does not work for a system account — see README)"
+    else
+        echo "    Status:   systemctl --user status searxng.service"
+        echo "    Logs:     journalctl --user -u searxng.service -f"
+        echo "    Restart:  systemctl --user restart searxng.service"
+        echo "    Stop:     systemctl --user stop searxng.service"
+    fi
     echo ""
     echo "  MCP Integration:"
     echo "    Endpoint: http://${BIND}:${PORT}/search"

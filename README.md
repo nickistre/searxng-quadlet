@@ -28,9 +28,15 @@ sudo ./install.sh --mode system
 # Verify it's working
 curl -fsS 'http://127.0.0.1:9123/search?q=test&format=json' | python3 -m json.tool
 
-# View logs
+# View logs (--mode user)
 journalctl --user -u searxng.service -f
+
+# View logs (--mode system)
+sudo journalctl _SYSTEMD_USER_UNIT=searxng.service + USER_UNIT=searxng.service -f
 ```
+
+See [Management Commands](#management-commands) for why system mode needs a different
+form.
 
 ## Installation Modes
 
@@ -108,6 +114,8 @@ Only created with `--favicons`. Enables favicon caching via DuckDuckGo resolver.
 
 ## Management Commands
 
+### `--mode user`
+
 ```bash
 # Check status
 systemctl --user status searxng.service
@@ -127,6 +135,53 @@ podman stats --no-stream searxng
 # Inspect container
 podman exec searxng cat /etc/searxng/settings.yml
 ```
+
+### `--mode system`
+
+The service runs under the `searxng` account's own systemd user manager, so every control
+command has to run *as that user*. Logs are the exception: read them as root (see below).
+If you installed with `--user NAME`, substitute that name for `searxng` throughout.
+
+```bash
+# Check status
+sudo -u searxng systemctl --user status searxng.service
+
+# View logs (as root — see note below)
+sudo journalctl _SYSTEMD_USER_UNIT=searxng.service + USER_UNIT=searxng.service -f
+
+# Restart after config changes
+sudo -u searxng systemctl --user restart searxng.service
+
+# Stop the service
+sudo -u searxng systemctl --user stop searxng.service
+
+# Rootless podman needs the service user's runtime dir
+SVC_RUN="XDG_RUNTIME_DIR=/run/user/$(id -u searxng)"
+
+# Check resource limits applied
+sudo -u searxng env "$SVC_RUN" podman stats --no-stream searxng
+
+# Inspect container
+sudo -u searxng env "$SVC_RUN" podman exec searxng cat /etc/searxng/settings.yml
+```
+
+**Why `journalctl --user` doesn't work in system mode:** the installer creates `searxng`
+as a *system* account (`useradd --system`, UID < 1000). journald only gives regular UIDs
+their own per-user journal file; everything a system UID logs, including its user units,
+goes to the system journal, which `searxng` can't read. So
+`sudo -u searxng journalctl --user ...` comes back empty or with a permission error, even
+though `systemctl --user status` (which asks the user manager over D-Bus) works fine.
+
+Reading the system journal as root and matching on the unit fields does work:
+
+- `_SYSTEMD_USER_UNIT=searxng.service` is the container's own output (podman logs to
+  journald from inside the unit).
+- `USER_UNIT=searxng.service` is the user manager's lifecycle messages about the unit
+  (starting, started, failed, stopped).
+- The `+` ORs the two. Swap `-f` for `-n 100`, `-b`, `--since '1 hour ago'`, etc.
+
+Don't use `sudo journalctl --user-unit searxng.service`: it silently adds a filter on the
+*caller's* UID (root, 0), so it never matches anything.
 
 ## Uninstallation
 
@@ -223,7 +278,10 @@ ss -tlnp | grep :9123
 
 ### Service won't start
 ```bash
+# --mode user
 journalctl --user -u searxng.service -n 50
+# --mode system
+sudo journalctl _SYSTEMD_USER_UNIT=searxng.service + USER_UNIT=searxng.service -n 50
 # Common causes:
 # - Port conflict
 # - SELinux denials (check with: sudo ausearch -m avc -ts recent)
@@ -240,7 +298,9 @@ search:
 ```
 
 ### Health check times out
-First pull can take several minutes. The installer waits up to 180s. If it still fails:
+First pull can take several minutes. The installer waits up to 180s. If it still fails
+(in `--mode system`, run the `podman` commands as the service user, as in
+[Management Commands](#--mode-system)):
 ```bash
 # Check if container is running
 podman ps -qf name=searxng
@@ -278,8 +338,13 @@ PodmanArgs=--security-opt label=disable
 
 Then reload and restart:
 ```bash
+# --mode user
 systemctl --user daemon-reload
 systemctl --user restart searxng.service
+
+# --mode system
+sudo -u searxng systemctl --user daemon-reload
+sudo -u searxng systemctl --user restart searxng.service
 ```
 
 ## System Requirements
