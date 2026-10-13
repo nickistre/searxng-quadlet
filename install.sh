@@ -742,7 +742,7 @@ generate_container_unit() {
 
     local image_ref
     if [[ "$NO_PULL" != true ]] && (( PODMAN_MAJOR >= 5 )); then
-        # .image unit pre-pulls (and, with the auto-update timer, refreshes) the image.
+        # .image unit pre-pulls the image if missing (the auto-update timer refreshes it).
         image_ref="searxng.image"
     else
         # No .image unit (--no-pull, or podman < 5): point directly at the
@@ -803,9 +803,14 @@ generate_image_unit() {
 
     info "Generating searxng.image..."
 
+    # Policy=missing: only pull when the image is absent. The default ("always")
+    # hits the registry on every boot, and because searxng.container hard-depends
+    # on this unit, a pull that races DNS/network bring-up fails the whole service.
+    # Updates are handled by AutoUpdate=registry + podman-auto-update.timer instead.
     cat > "$image_file" <<EOF
 [Image]
 Image=${IMAGE}
+Policy=missing
 
 [Service]
 TimeoutStartSec=900
